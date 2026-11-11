@@ -29,7 +29,7 @@ Este repositório é o pacote mínimo de operação. Ele não inclui o APK, o pr
 ```bash
 pkg update && pkg upgrade
 pkg install nodejs git
-git clone <URL_DO_REPOSITORIO> flowbot-termux-server
+git clone https://github.com/guilhermossauros/flowbot-termux-server.git flowbot-termux-server
 cd flowbot-termux-server
 npm install --omit=dev
 cp .env.example .env
@@ -59,6 +59,9 @@ Edite o arquivo `.env` quando precisar alterar a porta, o endereço de escuta ou
 | `FLOWBOT_HOST` | `0.0.0.0` | Interface de rede que aceita conexões. |
 | `FLOWBOT_AUTH_DIR` | `./data/auth` | Credenciais persistentes da sessão Baileys. |
 | `FLOWBOT_CODE_FILE` | `./data/custom-action.js` | Código personalizado executado para cada mensagem. |
+| `FLOWBOT_COMMANDS_FILE` | `./data/commands.json` | Regras de comandos criadas no APK. |
+| `FLOWBOT_BOT_STATE_FILE` | `./data/bot-state.json` | Estado persistente de bot ligado/desligado. |
+| `FLOWBOT_COMMAND_PREFIX` | `#` | Prefixo principal dos comandos; também aceita `/`, `!` e `.`. |
 | `PAIRING_PHONE` | vazio | Número usado para solicitar pairing code na inicialização. |
 
 Descubra o IP do aparelho no Termux com:
@@ -78,10 +81,9 @@ O modo local não exige login no APK. A sessão e as credenciais do WhatsApp fic
 ## Pareamento e ciclo de vida
 
 1. Inicie o servidor com `npm start`.
-2. No APK, informe a URL do Termux e toque em **Conectar Termux sem login**.
-3. Se necessário, envie `POST /api/v1/session/connect` com o número de telefone.
-4. Consulte `GET /api/v1/session/status` para acompanhar o pairing code e o estado.
-5. Depois do primeiro pareamento, mantenha `data/auth` preservado para reutilizar a sessão.
+2. No APK, informe a URL do Termux, o número com DDI e toque em **Conectar Termux sem login**. O app chama `POST /api/v1/session/connect` uma única vez.
+3. Consulte `GET /api/v1/session/status` para acompanhar o pairing code e o estado. O pairing code não é atualizado a cada evento de conexão.
+4. Depois do primeiro pareamento, mantenha `data/auth` preservado para reutilizar a sessão.
 
 Exemplo:
 
@@ -106,6 +108,11 @@ Todas as respostas são JSON e usam a base `/api/v1`.
 | `GET` | `/dashboard` | Obter um resumo operacional. |
 | `POST` | `/messages/send` | Enviar mensagem de texto. |
 | `POST` | `/custom-code` | Salvar o código personalizado. |
+| `GET` | `/bot/status` | Consultar se o bot está ligado. |
+| `POST` | `/bot/toggle` | Ligar ou desligar a execução das regras. |
+| `GET` | `/commands` | Listar comandos personalizados. |
+| `POST` | `/commands` | Criar ou atualizar um comando. |
+| `DELETE` | `/commands/:id` | Remover um comando. |
 
 Exemplo de saúde:
 
@@ -131,9 +138,15 @@ O runtime converte a mensagem recebida do Baileys para uma estrutura previsível
   message,
   isGroup,
   sender,
+  nomeUsuario,
+  numeroUsuario,
+  idMensagem,
   from,
   chat,
   fromMe,
+  texto,
+  comando,
+  argumentos,
   mimetyped: {
     mimetype,
     command
@@ -160,10 +173,35 @@ Campos mais usados:
 | `enviado.quotedMessage` | Mensagem citada, quando existir. |
 | `enviado.mentionedJidList` | Lista de JIDs mencionados. |
 | `enviado.metadata` | Metadados do grupo quando disponíveis. |
+| `enviado.nomeUsuario` | Nome exibido pelo remetente, quando o WhatsApp envia o `pushName`. |
+| `enviado.numeroUsuario` | Número do remetente sem o sufixo do JID. |
+| `enviado.idMensagem` | ID da mensagem recebida. |
+| `enviado.comando` | Comando normalizado, sem `#`, `/`, `!` ou `.`. |
+| `enviado.argumentos` | Texto depois do comando. |
 
 ## Código personalizado
 
 O arquivo configurado em `FLOWBOT_CODE_FILE` deve declarar `execute(client, enviado)`. O runtime aceita também os templates `export default async function execute(...)` usados no editor do APK.
+
+### Comandos criados pelo usuário
+
+O APK pode salvar regras em `POST /api/v1/commands`. Cada regra possui `name`, `aliases`, `enabled`, `groupOnly` e `code`. O código segue o mesmo formato de `custom-action.js` e é executado quando a mensagem começa com `#`, `/`, `!` ou `.` seguido do nome do comando.
+
+Exemplo de regra `ping`:
+
+```json
+{
+  "id": "ping",
+  "name": "ping",
+  "aliases": ["p"],
+  "description": "Confirma que o bot está ativo.",
+  "enabled": true,
+  "groupOnly": false,
+  "code": "export default async function execute(client, enviado) { await responderTexto(client, enviado.chat, 'pong ✅', enviado); }"
+}
+```
+
+No chat, o usuário pode chamar `#ping`, `/ping`, `!ping` ou `.ping`. Os argumentos ficam disponíveis em `enviado.argumentos`.
 
 Exemplo de saudação:
 

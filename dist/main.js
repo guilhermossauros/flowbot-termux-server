@@ -9,13 +9,46 @@ const port = Number(process.env.FLOWBOT_PORT ?? 3000);
 const host = process.env.FLOWBOT_HOST ?? "0.0.0.0";
 const authDir = resolve(process.env.FLOWBOT_AUTH_DIR ?? "./data/auth");
 const codeFile = resolve(process.env.FLOWBOT_CODE_FILE ?? "./data/custom-action.js");
+const commandsFile = resolve(process.env.FLOWBOT_COMMANDS_FILE ?? "./data/commands.json");
+const botStateFile = resolve(process.env.FLOWBOT_BOT_STATE_FILE ?? "./data/bot-state.json");
 const pairingPhone = process.env.PAIRING_PHONE?.replace(/\D/g, "");
+const commandPrefix = process.env.FLOWBOT_COMMAND_PREFIX ?? "#";
 const logger = pino({ level: "silent" });
 const logs = [];
 let socket = null;
 let connection = "disconnected";
 let pairingCode = null;
 let customCode = existsSync(codeFile) ? readFileSync(codeFile, "utf8") : "";
+let pairingTimer = null;
+let pairingInFlight = false;
+let reconnectTimer = null;
+let botEnabled = readJsonFile(botStateFile)?.enabled !== false;
+let commandRules = readJsonFile(commandsFile) ?? [];
+function readJsonFile(file) {
+    if (!existsSync(file))
+        return null;
+    try {
+        return JSON.parse(readFileSync(file, "utf8"));
+    }
+    catch {
+        return null;
+    }
+}
+function writeJsonFile(file, value) {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(value, null, 2), "utf8");
+}
+function normalizeCommand(value) {
+    return value.trim().toLowerCase().replace(/^[#!/.]+/, "").split(/\s+/)[0] ?? "";
+}
+function parseCommand(text) {
+    const raw = text?.trim() ?? "";
+    const prefix = raw.startsWith(commandPrefix) || /^[#!/.]/.test(raw);
+    if (!prefix)
+        return { name: null, args: "", raw };
+    const [first = "", ...rest] = raw.split(/\s+/);
+    return { name: normalizeCommand(first), args: rest.join(" "), raw };
+}
 function addLog(level, title, detail, args = "", payload) {
     const entry = { id: `${Date.now()}-${Math.random().toString(16).slice(2)}`, level, time: new Date().toISOString(), title, detail, args, payload };
     logs.push(entry);
@@ -53,15 +86,24 @@ async function normalizarEnviado(message) {
     const metadata = isGroup && socket ? await socket.groupMetadata(from).catch(() => null) : null;
     const contextInfo = raw.extendedTextMessage?.contextInfo ?? raw.imageMessage?.contextInfo ?? raw.videoMessage?.contextInfo ?? {};
     const mimetyped = messageType(raw);
+    const commandData = parseCommand(mimetyped.command);
+    const sender = key.participant ?? from;
+    const numeroUsuario = String(sender).split("@")[0]?.split(":")[0] ?? "";
     return {
         key,
         message: raw,
         isGroup,
-        sender: key.participant ?? from,
+        sender,
+        nomeUsuario: message.pushName ?? null,
+        numeroUsuario,
+        idMensagem: key.id ?? null,
         from,
         chat: from,
         fromMe: Boolean(key.fromMe),
         mimetyped,
+        texto: commandData.raw,
+        comando: commandData.name,
+        argumentos: commandData.args,
         quotedMessage: contextInfo.quotedMessage ?? null,
         quotedMessageSender: contextInfo.participant ?? null,
         mentionedJidList: contextInfo.mentionedJid ?? [],
@@ -131,12 +173,12 @@ function helpers(client, enviado) {
         baixarMidia: (c, mensagem) => baixarMidia(c, mensagem),
     };
 }
-async function executarCodigo(enviado) {
-    if (!socket || !customCode.trim())
+async function executarFonte(code, enviado, fileName, context = {}) {
+    if (!socket || !code.trim())
         return;
-    const output = (method, values) => addLog("codigo", "custom-action.js", method, values.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join(" "));
-    const sandbox = { ...helpers(socket, enviado), console: { log: (...values) => output("console.log", values), info: (...values) => output("console.info", values), warn: (...values) => output("console.warn", values), error: (...values) => output("console.error", values) }, Buffer, JSON, setTimeout, clearTimeout };
-    const source = customCode.replace(/export\s+default\s+async\s+function\s+execute/, "async function execute").replace(/export\s+default\s+function\s+execute/, "function execute");
+    const output = (method, values) => addLog("codigo", fileName, method, values.map((value) => typeof value === "string" ? value : JSON.stringify(value)).join(" "));
+    const sandbox = { ...helpers(socket, enviado), ...context, console: { log: (...values) => output("console.log", values), info: (...values) => output("console.info", values), warn: (...values) => output("console.warn", values), error: (...values) => output("console.error", values) }, Buffer, JSON, setTimeout, clearTimeout };
+    const source = code.replace(/export\s+default\s+async\s+function\s+execute/, "async function execute").replace(/export\s+default\s+function\s+execute/, "function execute");
     const script = new Script(`(async () => { ${source}\n if (typeof execute !== "function") throw new Error("O código precisa exportar execute(client, enviado)"); return execute(client, enviado); })()`);
     try {
         await Promise.race([script.runInNewContext(sandbox), new Promise((_, reject) => setTimeout(() => reject(new Error("Tempo limite do código excedido.")), 8000))]);
@@ -145,6 +187,22 @@ async function executarCodigo(enviado) {
         output("console.error", [error instanceof Error ? error.message : String(error)]);
     }
 }
+async function executarComandos(enviado) {
+    const command = normalizeCommand(enviado.comando ?? "");
+    if (!command)
+        return;
+    const matching = commandRules.filter((rule) => rule.enabled && !rule.groupOnly || rule.enabled && rule.groupOnly && enviado.isGroup)
+        .filter((rule) => [rule.name, ...rule.aliases].some((alias) => normalizeCommand(alias) === command));
+    for (const rule of matching) {
+        await executarFonte(rule.code, enviado, `command:${rule.name}.js`, { comando: command, argumentos: enviado.argumentos, regra: rule });
+    }
+}
+async function executarCodigo(enviado) {
+    if (!botEnabled)
+        return;
+    await executarComandos(enviado);
+    await executarFonte(customCode, enviado, "custom-action.js");
+}
 async function conectar(phoneNumber = pairingPhone) {
     if (socket && connection !== "disconnected")
         return;
@@ -152,25 +210,53 @@ async function conectar(phoneNumber = pairingPhone) {
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
     const client = makeWASocket({ auth: state, printQRInTerminal: false, logger, generateHighQualityLinkPreview: false });
     socket = client;
+    connection = "connecting";
+    pairingCode = null;
+    pairingInFlight = false;
     client.ev.on("creds.update", saveCreds);
     client.ev.on("connection.update", async ({ connection: next, lastDisconnect }) => {
         connection = next ?? connection;
         addLog("avancados", "connection.update", `status=${connection}`, lastDisconnect ? String(lastDisconnect.error ?? "disconnect") : "");
-        if (connection === "open")
+        if (connection === "open") {
+            if (pairingTimer)
+                clearTimeout(pairingTimer);
+            pairingTimer = null;
+            pairingCode = null;
             addLog("resumidos", "Sessão conectada", "Baileys pronto para receber mensagens", "");
-        if (connection === "close") {
-            socket = null;
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            if (shouldReconnect)
-                setTimeout(() => conectar(phoneNumber).catch((error) => addLog("avancados", "reconnect.error", String(error))), 1500);
         }
-        if (!state.creds.registered && phoneNumber && connection === "connecting") {
-            setTimeout(async () => { if (socket && !state.creds.registered) {
-                pairingCode = await socket.requestPairingCode(phoneNumber);
-                addLog("resumidos", "Pairing code", "Código gerado no servidor Termux", pairingCode);
-            } }, 1800);
+        if (connection === "close") {
+            if (pairingTimer)
+                clearTimeout(pairingTimer);
+            pairingTimer = null;
+            socket = null;
+            pairingInFlight = false;
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect && !reconnectTimer) {
+                reconnectTimer = setTimeout(() => {
+                    reconnectTimer = null;
+                    conectar(phoneNumber).catch((error) => addLog("avancados", "reconnect.error", String(error)));
+                }, 2000);
+            }
         }
     });
+    if (!state.creds.registered && phoneNumber) {
+        pairingTimer = setTimeout(async () => {
+            pairingTimer = null;
+            if (socket !== client || state.creds.registered || pairingInFlight || connection === "close")
+                return;
+            pairingInFlight = true;
+            try {
+                pairingCode = await client.requestPairingCode(phoneNumber);
+                addLog("resumidos", "Pairing code", "Código gerado uma única vez para esta tentativa", pairingCode);
+            }
+            catch (error) {
+                addLog("avancados", "pairing.error", error instanceof Error ? error.message : String(error));
+            }
+            finally {
+                pairingInFlight = false;
+            }
+        }, 1800);
+    }
     client.ev.on("messages.upsert", async ({ messages, type }) => {
         if (type !== "notify")
             return;
@@ -178,7 +264,8 @@ async function conectar(phoneNumber = pairingPhone) {
             const enviado = await normalizarEnviado(message);
             addLog("resumidos", "Mensagem recebida", `FROM_ID: ${enviado.from} · SENDER: ${enviado.sender}`, `ARGUMENTS: ${enviado.mimetyped.command ?? `[${enviado.mimetyped.mimetype}]`}`);
             addLog("avancados", "messages.upsert", `key.id=${enviado.key.id} · fromMe=${enviado.fromMe}`, `mimetype=${enviado.mimetyped.mimetype} · quoted=${Boolean(enviado.quotedMessage)}`, enviado);
-            await executarCodigo(enviado);
+            if (botEnabled)
+                await executarCodigo(enviado);
         }
     });
 }
@@ -205,10 +292,18 @@ const server = createServer(async (req, res) => {
             return json(res, 200, { status: connection, pairingCode, hasAuth: existsSync(authDir) });
         if (url.pathname === "/api/v1/session/connect" && req.method === "POST") {
             const input = await body(req);
-            await conectar(input.phoneNumber ?? pairingPhone);
-            return json(res, 202, { status: "connecting", pairingCode });
+            const phoneNumber = String(input.phoneNumber ?? pairingPhone ?? "").replace(/\D/g, "") || undefined;
+            await conectar(phoneNumber);
+            return json(res, 202, { status: connection, pairingCode, hasAuth: existsSync(authDir), pairingRequired: Boolean(phoneNumber) });
         }
         if (url.pathname === "/api/v1/session/disconnect" && req.method === "POST") {
+            if (pairingTimer)
+                clearTimeout(pairingTimer);
+            if (reconnectTimer)
+                clearTimeout(reconnectTimer);
+            pairingTimer = null;
+            reconnectTimer = null;
+            pairingInFlight = false;
             socket?.end(undefined);
             socket = null;
             connection = "disconnected";
@@ -216,11 +311,43 @@ const server = createServer(async (req, res) => {
         }
         if (url.pathname === "/api/v1/logs" && req.method === "GET") {
             const level = url.searchParams.get("level");
-            const limit = Math.min(Number(url.searchParams.get("limit") ?? 100), 500);
+            const requestedLimit = Number(url.searchParams.get("limit") ?? 100);
+            const limit = Number.isFinite(requestedLimit) ? Math.max(1, Math.min(requestedLimit, 500)) : 100;
             return json(res, 200, logs.filter((item) => !level || item.level === level).slice(-limit));
         }
         if (url.pathname === "/api/v1/dashboard")
             return json(res, 200, { server: { status: connection === "open" ? "online" : "offline", version: "termux-0.1.0", uptimeSeconds: Math.floor(process.uptime()) }, sessions: { active: connection === "open" ? 1 : 0, total: 1 }, messages: { received: logs.filter((item) => item.title === "Mensagem recebida").length, sent: 0 }, flows: { active: customCode ? 1 : 0, executionsInProgress: 0 }, failuresRecent: logs.filter((item) => item.title === "console.error").length });
+        if (url.pathname === "/api/v1/bot/status" && req.method === "GET")
+            return json(res, 200, { enabled: botEnabled, commands: commandRules.filter((rule) => rule.enabled).length });
+        if (url.pathname === "/api/v1/bot/toggle" && req.method === "POST") {
+            const input = await body(req);
+            botEnabled = Boolean(input.enabled);
+            writeJsonFile(botStateFile, { enabled: botEnabled, updatedAt: new Date().toISOString() });
+            addLog("resumidos", botEnabled ? "Bot ativado" : "Bot pausado", "Estado alterado pelo painel", "");
+            return json(res, 200, { enabled: botEnabled });
+        }
+        if (url.pathname === "/api/v1/commands" && req.method === "GET")
+            return json(res, 200, commandRules);
+        if (url.pathname === "/api/v1/commands" && req.method === "POST") {
+            const input = await body(req);
+            const name = normalizeCommand(String(input.name ?? ""));
+            if (!name || !String(input.code ?? "").trim())
+                return json(res, 400, { error: { message: "name e code são obrigatórios." } });
+            const aliases = (Array.isArray(input.aliases) ? input.aliases : String(input.aliases ?? "").split(/[\s,]+/)).map((value) => normalizeCommand(String(value))).filter(Boolean);
+            const rule = { id: String(input.id ?? name), name, aliases: Array.from(new Set(aliases.filter((alias) => alias !== name))), description: String(input.description ?? ""), enabled: input.enabled !== false, groupOnly: input.groupOnly === true, code: String(input.code), updatedAt: new Date().toISOString() };
+            commandRules = [...commandRules.filter((item) => item.id !== rule.id), rule];
+            writeJsonFile(commandsFile, commandRules);
+            addLog("codigo", `command:${rule.name}`, "Comando salvo pelo painel", rule.aliases.join(", "));
+            return json(res, 200, rule);
+        }
+        if (url.pathname.startsWith("/api/v1/commands/") && req.method === "DELETE") {
+            const id = decodeURIComponent(url.pathname.slice("/api/v1/commands/".length));
+            const before = commandRules.length;
+            commandRules = commandRules.filter((item) => item.id !== id);
+            if (commandRules.length !== before)
+                writeJsonFile(commandsFile, commandRules);
+            return json(res, 200, { deleted: commandRules.length !== before });
+        }
         if (url.pathname === "/api/v1/messages/send" && req.method === "POST") {
             const input = await body(req);
             if (!socket)
