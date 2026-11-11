@@ -324,7 +324,7 @@ const server = createServer(async (req, res) => {
             botEnabled = Boolean(input.enabled);
             writeJsonFile(botStateFile, { enabled: botEnabled, updatedAt: new Date().toISOString() });
             addLog("resumidos", botEnabled ? "Bot ativado" : "Bot pausado", "Estado alterado pelo painel", "");
-            return json(res, 200, { enabled: botEnabled });
+            return json(res, 200, { enabled: botEnabled, commands: commandRules.filter((rule) => rule.enabled).length });
         }
         if (url.pathname === "/api/v1/commands" && req.method === "GET")
             return json(res, 200, commandRules);
